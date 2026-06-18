@@ -12,15 +12,23 @@ pub fn spawn_worker(
     worker_id: usize,
     handler: TaskHandler,
     mut task_rx: mpsc::Receiver<Task>,
-    _pending_count: Arc<AtomicUsize>,
+    global_pending: Arc<AtomicUsize>,
+    active_workers: Arc<AtomicUsize>,
+    last_activity: Arc<std::sync::RwLock<Instant>>,
     metrics_completed: Arc<crate::metrics::MetricsCounters>,
     dead_letter: Arc<crate::dead_letter::DeadLetterQueue>,
 ) {
+    active_workers.fetch_add(1, Ordering::Relaxed);
     tokio::spawn(async move {
         info!(worker_id, "worker started");
         loop {
             match task_rx.recv().await {
                 Some(task) => {
+                    global_pending.fetch_sub(1, Ordering::Relaxed);
+                    if let Ok(mut t) = last_activity.write() {
+                        *t = Instant::now();
+                    }
+                    
                     let receipt = execute_task(task, &handler, worker_id).await;
                     
                     match &receipt.result {
@@ -49,6 +57,7 @@ pub fn spawn_worker(
                 }
             }
         }
+        active_workers.fetch_sub(1, Ordering::Relaxed);
         info!(worker_id, "worker stopped");
     });
 }

@@ -7,7 +7,6 @@ use tokio::sync::mpsc;
 pub(crate) struct WorkerSlot {
     pub id: usize,
     pub tx: mpsc::Sender<Task>,
-    pub pending_count: Arc<AtomicUsize>,
 }
 
 pub struct Scheduler {
@@ -16,21 +15,23 @@ pub struct Scheduler {
     rr_index: AtomicUsize,
     priority_queue: BinaryHeap<Task>,
     delayed_tasks: Vec<Task>,
+    global_pending: Arc<AtomicUsize>,
 }
 
 impl Scheduler {
-    pub fn new(strategy: ScheduleStrategy) -> Self {
+    pub fn new(strategy: ScheduleStrategy, global_pending: Arc<AtomicUsize>) -> Self {
         Scheduler {
             strategy,
             workers: Vec::new(),
             rr_index: AtomicUsize::new(0),
             priority_queue: BinaryHeap::new(),
             delayed_tasks: Vec::new(),
+            global_pending,
         }
     }
 
-    pub fn add_worker(&mut self, id: usize, tx: mpsc::Sender<Task>, pending_count: Arc<AtomicUsize>) {
-        self.workers.push(WorkerSlot { id, tx, pending_count });
+    pub fn add_worker(&mut self, id: usize, tx: mpsc::Sender<Task>) {
+        self.workers.push(WorkerSlot { id, tx });
     }
 
     pub fn remove_worker(&mut self, id: usize) {
@@ -62,7 +63,8 @@ impl Scheduler {
     }
 
     pub async fn dispatch(&mut self, task: Task) -> bool {
-        match self.strategy {
+        self.global_pending.fetch_add(1, Ordering::Relaxed);
+        let ok = match self.strategy {
             ScheduleStrategy::RoundRobin => self.dispatch_round_robin(task).await,
             ScheduleStrategy::LeastLoaded => self.dispatch_least_loaded(task).await,
             ScheduleStrategy::Priority | ScheduleStrategy::DelayedQueue => {
@@ -70,7 +72,11 @@ impl Scheduler {
                 self.flush_queues().await;
                 true
             }
+        };
+        if !ok {
+            self.global_pending.fetch_sub(1, Ordering::Relaxed);
         }
+        ok
     }
 
     async fn dispatch_round_robin(&self, task: Task) -> bool {
@@ -79,7 +85,6 @@ impl Scheduler {
         }
         let idx = self.rr_index.fetch_add(1, Ordering::Relaxed) % self.workers.len();
         let worker = &self.workers[idx];
-        worker.pending_count.fetch_add(1, Ordering::Relaxed);
         worker.tx.send(task).await.is_ok()
     }
 
@@ -87,15 +92,23 @@ impl Scheduler {
         if self.workers.is_empty() {
             return false;
         }
-        let worker = self.workers.iter().min_by_key(|w| w.pending_count.load(Ordering::Relaxed)).unwrap();
-        worker.pending_count.fetch_add(1, Ordering::Relaxed);
-        worker.tx.send(task).await.is_ok()
+        let min_len = self.workers.iter()
+            .map(|w| w.tx.max_capacity() - w.tx.capacity())
+            .min()
+            .unwrap_or(usize::MAX);
+        if let Some(worker) = self.workers.iter()
+            .find(|w| (w.tx.max_capacity() - w.tx.capacity()) == min_len)
+        {
+            worker.tx.send(task).await.is_ok()
+        } else {
+            false
+        }
     }
 
     pub async fn flush_queues(&mut self) {
         self.flush_delayed();
         while let Some(task) = self.priority_queue.pop() {
-            if !self.dispatch_to_least_loaded(task).await {
+            if !self.dispatch_to_any(task).await {
                 break;
             }
         }
@@ -113,24 +126,31 @@ impl Scheduler {
         }
     }
 
-    async fn dispatch_to_least_loaded(&self, task: Task) -> bool {
+    async fn dispatch_to_any(&self, task: Task) -> bool {
         if self.workers.is_empty() {
             return false;
         }
-        let worker = self.workers.iter().min_by_key(|w| w.pending_count.load(Ordering::Relaxed)).unwrap();
-        worker.pending_count.fetch_add(1, Ordering::Relaxed);
-        worker.tx.send(task).await.is_ok()
+        for worker in &self.workers {
+            if worker.tx.capacity() > 0 {
+                if worker.tx.send(task).await.is_ok() {
+                    return true;
+                } else {
+                    return false;
+                }
+            }
+        }
+        self.workers[0].tx.send(task).await.is_ok()
     }
 
     pub fn total_pending(&self) -> usize {
-        self.workers.iter().map(|w| w.pending_count.load(Ordering::Relaxed)).sum()
+        self.global_pending.load(Ordering::Relaxed)
     }
 
     pub fn queued_count(&self) -> usize {
         self.priority_queue.len() + self.delayed_tasks.len()
     }
 
-    pub fn last_worker_id(&self) -> Option<usize> {
-        self.workers.last().map(|w| w.id)
+    pub fn worker_ids(&self) -> Vec<usize> {
+        self.workers.iter().map(|w| w.id).collect()
     }
 }

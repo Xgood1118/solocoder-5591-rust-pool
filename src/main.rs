@@ -26,9 +26,9 @@ async fn main() {
         max_workers: 8,
         max_queue_size: 5000,
         scale_up_threshold: 50,
-        idle_timeout_secs: 30,
-        scale_check_interval_secs: 3,
-        shutdown_timeout_secs: 30,
+        idle_timeout_secs: 5,
+        scale_check_interval_secs: 2,
+        shutdown_timeout_secs: 10,
         schedule_strategy: ScheduleStrategy::Priority,
     };
 
@@ -91,7 +91,7 @@ async fn main() {
 
     let metrics_handle = metrics.clone();
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut interval = tokio::time::interval(Duration::from_secs(3));
         loop {
             interval.tick().await;
             let json = metrics_handle.to_json().await;

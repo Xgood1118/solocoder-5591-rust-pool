@@ -2,7 +2,7 @@ use crate::dead_letter::DeadLetterQueue;
 use crate::scheduler::Scheduler;
 use serde::Serialize;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 
 #[derive(Debug, Default)]
@@ -29,6 +29,7 @@ pub struct MetricsSnapshot {
 pub struct Metrics {
     counters: Arc<MetricsCounters>,
     scheduler: Arc<RwLock<Scheduler>>,
+    active_workers: Arc<AtomicUsize>,
     dead_letter: Arc<DeadLetterQueue>,
 }
 
@@ -36,11 +37,13 @@ impl Metrics {
     pub fn new(
         counters: Arc<MetricsCounters>,
         scheduler: Arc<RwLock<Scheduler>>,
+        active_workers: Arc<AtomicUsize>,
         dead_letter: Arc<DeadLetterQueue>,
     ) -> Self {
         Metrics {
             counters,
             scheduler,
+            active_workers,
             dead_letter,
         }
     }
@@ -54,9 +57,9 @@ impl Metrics {
 
         let scheduler = self.scheduler.read().await;
         let pending = scheduler.total_pending() + scheduler.queued_count();
-        let active_workers = scheduler.worker_count();
         drop(scheduler);
 
+        let active_workers = self.active_workers.load(Ordering::Relaxed);
         let dead_letter_count = self.dead_letter.len().await;
 
         let avg_elapsed_ms = if total_completed > 0 {
